@@ -12,14 +12,24 @@ import os
 
 
 class MNISTClassifier(L.LightningModule):
-    def __init__(self):
+    def __init__(self, lr, gamma, data_dir, batch_size, test_batch_size):
         super().__init__()
+        self.lr = lr
+        self.gamma = gamma
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
         self.dropout1 = nn.Dropout(0.25)
         self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(9216, 128)
         self.fc2 = nn.Linear(128, 10)
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.test_batch_size = test_batch_size
+
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,))
+        ])
 
     def forward(self, x):
         x = self.conv1(x)
@@ -37,8 +47,8 @@ class MNISTClassifier(L.LightningModule):
         return output
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adadelta(self.parameters(), lr=self.hparams.lr)
-        scheduler = StepLR(optimizer, step_size=1, gamma=self.hparams.gamma)
+        optimizer = torch.optim.Adadelta(self.parameters(), lr=self.lr)
+        scheduler = StepLR(optimizer, step_size=1, gamma=self.gamma)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def training_step(self, batch, batch_idx):
@@ -53,38 +63,24 @@ class MNISTClassifier(L.LightningModule):
         output = self.forward(data)
         loss = F.nll_loss(output, target)
         self.log('val_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return loss
 
     def test_step(self, batch, batch_idx):
         data, target = batch
         output = self.forward(data)
-        loss = F.nll_loss(output, target, reduction='sum').item()
+        # loss = F.nll_loss(output, target, reduction='sum').item()
+        loss = F.nll_loss(output, target)
+        pred = torch.argmax(output, dim=1)
         self.log('test_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        pred = output.argmax(dim=1, keepdim=True)
-        correct = pred.eq(target.view_as(pred)).sum().item()
-        return {'test_loss': loss, 'correct': correct}
+        # correct = pred.eq(target.view_as(pred)).sum().item()
+        self.log('test_acc', self.test_accuracy, prog_bar=True)
 
-    def test_epoch_end(self, outputs):
-        test_loss = sum([x['test_loss'] for x in outputs]) / len(self.test_dataloader().dataset)
-        accuracy = 100. * sum([x['correct'] for x in outputs]) / len(self.test_dataloader().dataset)
-        self.log('test_loss', test_loss)
-        self.log('accuracy', accuracy)
+    #####################
+    # DATA RELATED HOOKS
+    ####################
 
-
-class MNISTDataModule(L.LightningDataModule):
-    def __int__(self, batch_size):
-        self.data_dir = str(os.path.join(os.getenv('TEACHER_DIR'), 'JHL_data'))
-        self.batch_size = batch_size
-        self.num_workers = int(os.environ["SLURM_CPUS_PER_TASK"])
-
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
-
-    def prepare_data(self):
-        datasets.MNIST(self.data_dir, train=True, download=False)
-        datasets.MNIST(self.data_dir, train=False)
+    #def prepare_data(self):
+    #    datasets.MNIST(self.data_dir, train=True, download=False)
+    #    datasets.MNIST(self.data_dir, train=False) 
 
     def setup(self, stage=None):
         if stage == 'fit' or stage is None:
@@ -94,13 +90,13 @@ class MNISTDataModule(L.LightningDataModule):
             self.mnist_test = datasets.MNIST(self.data_dir, train=False, transform=self.transform)
 
     def train_dataloader(self):
-        return DataLoader(self.mnist_train, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+        return DataLoader(self.mnist_train, batch_size=self.batch_size, shuffle="True")
 
     def val_dataloader(self):
-        return DataLoader(self.mnist_val, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+        return DataLoader(self.mnist_val, batch_size=self.batch_size)
 
     def test_dataloader(self):
-        return DataLoader(self.mnist_test, batch_size=self.batch_size, num_workers=self.num_workers, shuffle=True)
+        return DataLoader(self.mnist_test, batch_size=self.test_batch_size)
 
 
 def main():
@@ -116,8 +112,6 @@ def main():
                         help='learning rate (default: 1.0)')
     parser.add_argument('--gamma', type=float, default=0.7, metavar='M',
                         help='Learning rate step gamma (default: 0.7)')
-    parser.add_argument('--no-cuda', action='store_true', default=False,
-                        help='disables CUDA training')
     parser.add_argument('--dry-run', action='store_true', default=False,
                         help='quickly check a single pass')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -128,16 +122,31 @@ def main():
                         help='For Saving the current Model')
     args = parser.parse_args()
 
+    if not torch.cuda.is_available():
+        raise Exception('CUDA not found')
+
+    torch.manual_seed(args.seed)
+   
+   # train_kwargs = {'batch_size': args.batch_size}
+   # test_kwargs = {'batch_size': args.test_batch_size}
+   # cuda_kwargs = {'num_workers': int(os.environ["SLURM_CPUS_PER_TASK"]),
+   #                 'pin_memory': True,
+   #                 'shuffle': True}
+   # train_kwargs.update(cuda_kwargs)
+   # test_kwargs.update(cuda_kwargs)
+
+    DATA_PATH = os.getenv('TEACHER_DIR')
+    MNIST_DATA = os.path.join(DATA_PATH, 'JHS_data')
     # torch.manual_seed(args.seed)
 
-    world_size = int(os.environ["WORLD_SIZE"])
-    rank = int(os.environ["SLURM_PROCID"])
-    gpus_per_node = torch.cuda.device_count()
+    #world_size = int(os.environ["WORLD_SIZE"])
+    #rank = int(os.environ["SLURM_PROCID"])
+    #gpus_per_node = torch.cuda.device_count()
 
-    data_module = MNISTDataModule()
-    model = MNISTClassifier()
-    trainer = L.Trainer(gpus=rank, accelerator="ddp")
-    trainer.fit(model, data_module)
+    # data_module = MNISTDataModule(MNIST_DATA, args.batch_size, args.test_batch_size)
+    model = MNISTClassifier(args.lr, args.gamma, MNIST_DATA, args.batch_size, args.test_batch_size)
+    trainer = L.Trainer(max_epochs=5)
+    trainer.fit(model)
 
 
 if __name__ == '__main__':

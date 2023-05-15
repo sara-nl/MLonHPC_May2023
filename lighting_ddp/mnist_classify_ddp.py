@@ -5,13 +5,10 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.optim.lr_scheduler import StepLR
-
-######################## DDP ##############################
 import os
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from socket import gethostname
-######################## DDP ##############################
 
 
 """
@@ -53,7 +50,6 @@ class Net(nn.Module):
         return output
 
 # Simple Train
-    
 def train(args, model, device, train_loader, optimizer, epoch):
     model.train()
     
@@ -89,8 +85,8 @@ def train(args, model, device, train_loader, optimizer, epoch):
     
     ######## throughput #######################
     # average time per batch in seconds
-    throughput = (repetitions*args.batch_size) / total_time
-    print(f"number of images/s through the model during training: {throughput}")
+    #throughput = (repetitions*args.batch_size) / total_time
+    #print(f"number of images/s through the model during training: {throughput}")
     ######## throughput #######################
 
 def test(model, device, test_loader):
@@ -118,6 +114,10 @@ def test(model, device, test_loader):
 def setup(rank, world_size):
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+
+def cleanup():
+    # clean up the distributed environment
+    dist.destroy_process_group()
 ######################## DDP ##############################
     
     
@@ -129,14 +129,12 @@ def main():
                         help='input batch size for training (default: 64)')
     parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
                         help='input batch size for testing (default: 1000)')
-    parser.add_argument('--epochs', type=int, default=2, metavar='N',
-                        help='number of epochs to train (default: 14)')
+    parser.add_argument('--epochs', type=int, default=5, metavar='N',
+                        help='number of epochs to train (default: 5)')
     parser.add_argument('--lr', type=float, default=1.0, metavar='LR',
                         help='learning rate (default: 1.0)')
     parser.add_argument('--gamma', type=float, default=0.7, metavar='M',
                         help='Learning rate step gamma (default: 0.7)')
-    parser.add_argument('--no-cuda', action='store_true', default=False,
-                        help='disables CUDA training')
     parser.add_argument('--dry-run', action='store_true', default=False,
                         help='quickly check a single pass')
     parser.add_argument('--seed', type=int, default=1, metavar='S',
@@ -146,34 +144,36 @@ def main():
     parser.add_argument('--save-model', action='store_true', default=False,
                         help='For Saving the current Model')
     args = parser.parse_args()
-    use_cuda = not args.no_cuda and torch.cuda.is_available()
+
+    if not torch.cuda.is_available():
+        raise Exception('CUDA not found')
 
     torch.manual_seed(args.seed)
-    
+   
     train_kwargs = {'batch_size': args.batch_size}
     test_kwargs = {'batch_size': args.test_batch_size}
-    if use_cuda:
-        cuda_kwargs = {'num_workers': int(os.environ["SLURM_CPUS_PER_TASK"]),
-                       'pin_memory': True,
-                       'shuffle': True}
-        train_kwargs.update(cuda_kwargs)
-        test_kwargs.update(cuda_kwargs)
+    cuda_kwargs = {'num_workers': int(os.environ["SLURM_CPUS_PER_TASK"]),
+                    'pin_memory': True,
+                    'shuffle': True}
+    train_kwargs.update(cuda_kwargs)
+    test_kwargs.update(cuda_kwargs)
 
     transform=transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
         ])
+
     DATA_PATH = os.getenv('TEACHER_DIR')
-    MNIST_DATA = os.path.join(DATA_PATH, 'JHL_data')
+    MNIST_DATA = os.path.join(DATA_PATH, 'JHS_data')
     
     # LOAD MNIST
-    dataset1 = datasets.MNIST(MNIST_DATA, train=True, download=False,
+    train_dset = datasets.MNIST(MNIST_DATA, train=True, download=False,
                        transform=transform)
-    dataset2 = datasets.MNIST(MNIST_DATA, train=False,
+    test_dset = datasets.MNIST(MNIST_DATA, train=False,
                        transform=transform)
     
     ######################## DDP ##############################
-    world_size = int(os.environ["WORLD_SIZE"])
+    world_size = int(os.environ["SLURM_NTASKS"])
     rank = int(os.environ["SLURM_PROCID"])
     gpus_per_node = torch.cuda.device_count()
 
@@ -184,20 +184,15 @@ def main():
     torch.cuda.set_device(local_rank)
     print(f"host: {gethostname()}, rank: {rank}, local_rank: {local_rank}")
 
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset1, num_replicas=world_size, rank=rank)
     ######################## DDP ##############################
-    
-    train_loader = torch.utils.data.DataLoader(dataset1, batch_size=args.batch_size, sampler=train_sampler, \
-                                               num_workers=int(os.environ["SLURM_CPUS_PER_TASK"]), pin_memory=True)
-    test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
-    
+    train_loader = torch.utils.data.DataLoader(train_dset, **train_kwargs)
+    test_loader = torch.utils.data.DataLoader(test_dset, **test_kwargs)
     
     ######################## DDP ##############################
     model = Net().to(local_rank)
     ddp_model = DDP(model, device_ids=[local_rank])
-    ######################## DDP ##############################
-    
     optimizer = optim.Adadelta(ddp_model.parameters(), lr=args.lr)
+    ######################## DDP ##############################
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for epoch in range(1, args.epochs + 1):
@@ -208,7 +203,7 @@ def main():
     if args.save_model and rank == 0:
         torch.save(model.state_dict(), "mnist_cnn.pt")
 
-    dist.destroy_process_group()
+    cleanup()
 
 
 if __name__ == '__main__':
